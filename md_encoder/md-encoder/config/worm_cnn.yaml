@@ -1,0 +1,41 @@
+encoder:
+  spatial_hash:
+    gauss_width: 0.4
+    number_of_atom_types: 3
+    n_streams: 4
+    num_divisions: 24
+    num_points_1d_per_bin_voxel: 9
+    buffer_factor: 4 # 5.  # 1.2
+  kernel_widths: [3, 3, 3]
+  kernel_strides: [3, 3, 3]
+  conv_channels: [32, 64, 512] # [32, 64, 128]
+  depth: 4
+  stride: 2
+  scope: 1
+  channels: 3
+  pos_enc_dim: 32
+  n_head: 4
+  qk_dim: 128
+  v_dim: 128
+  out_dim: 32
+  zero_init: false
+
+decoder:
+  atom_rep_channel: 64
+  stochastic_folding: false  # dropout the same neurons on each iteration
+  num_iter: 8
+  num_layer_in_transition: 3
+  num_channel: 64
+  zero_init: false
+  dropout: 0.15
+  local_point_attention:
+    attention:
+      key_dim: 32
+      value_dim: 32
+      num_head: 4
+      gating: true
+      output_dim: 64
+    output_dim: 64
+  global_config:
+    zero_init: false
+    deterministic: false
