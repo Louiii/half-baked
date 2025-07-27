@@ -8,546 +8,561 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from md_encoder.utils.read_md_utils import read_frames
+from matplotlib.animation import FuncAnimation
 from tqdm import tqdm
+from utils.read_md_utils import read_frames
 
-# from utils import make_vid
 
-
-def stream(
-    shard: jnp.array,
-    shard_mask: jnp.array,
-    num_divisions: int,
-    box_length: float,
-    spatial_dimension: int,
-    buffer_factor: float = 2.0,
-):# -> Tuple[jnp.array, jnp.array]:
-    """note to self: could do an add op in the buffer and increment the counter by mask
+def bin_particles_into_cells(
+    particle_shard: jnp.array,
+    particle_mask: jnp.array,
+    num_cells: int,
+    box_size: float,
+    dimension_index: int,
+    buffer_scale_factor: float = 2.0,
+) -> Tuple[jnp.array, jnp.array, jnp.array]:
+    """Bins particles from a shard into spatial cells along a specific dimension.
+    
+    This function assigns particles to cells based on their position in the specified
+    dimension and stores them in buffers. It uses a loop to sequentially place particles
+    into the appropriate cell's buffer, updating counts and masks accordingly.
+    
+    Note: Could potentially optimize by using an add operation in the buffer and
+    incrementing the counter by the mask value.
 
     Args:
-        shard (jnp.array[num_per_shard, 3]): _description_
-        shard_mask (jnp.array[num_per_shard]): _description_
-        num_divisions (int): _description_
-        box_length (float): _description_
-        spatial_dimension (int): _description_
-        buffer_factor (float): _description_
+        particle_shard (jnp.array[num_per_shard, data_dim]): Array of particle data (e.g., positions).
+        particle_mask (jnp.array[num_per_shard]): Mask indicating valid particles (1 for valid, 0 otherwise).
+        num_cells (int): Number of spatial cells to divide the box into.
+        box_size (float): Length of the simulation box along the binning dimension.
+        dimension_index (int): Index of the dimension (e.g., 0 for x, 1 for y) to bin along.
+        buffer_scale_factor (float, optional): Factor to scale the buffer size per cell. Defaults to 2.0.
 
     Returns:
-        buffer (jnp.array[num_divisions, division_buffer_size, 3]): _description_
-        buffer_mask (jnp.array[num_divisions, division_buffer_size]): _description_
-        counts (jnp.array[num_divisions]): _description_
+        cell_buffers (jnp.array[num_cells, cell_buffer_size, data_dim]): Buffers holding particles per cell.
+        cell_buffer_masks (jnp.array[num_cells, cell_buffer_size]): Masks for the buffers.
+        cell_counts (jnp.array[num_cells]): Number of valid particles per cell.
     """
-    data_dim = shard.shape[-1]
-    num_in_shard = shard.shape[0]
-    division_buffer_size = int(buffer_factor * num_in_shard / num_divisions)
-    buffer_ = jnp.zeros(
-        (num_divisions, division_buffer_size, data_dim), dtype=shard.dtype
+    data_dim = particle_shard.shape[-1]
+    num_particles_in_shard = particle_shard.shape[0]
+    cell_buffer_size = int(buffer_scale_factor * num_particles_in_shard / num_cells)
+    cell_buffers = jnp.zeros(
+        (num_cells, cell_buffer_size, data_dim), dtype=particle_shard.dtype
     )
-    buffer_mask = jnp.zeros((num_divisions, division_buffer_size), dtype=jnp.int32)
-    counts = jnp.zeros(num_divisions, dtype=jnp.int32)
+    cell_buffer_masks = jnp.zeros((num_cells, cell_buffer_size), dtype=jnp.int32)
+    cell_counts = jnp.zeros(num_cells, dtype=jnp.int32)
 
-    def loop_body(i, args):
-        shard, shard_mask, buffer_, buffer_mask, counts = args
-        x = shard[i]
-        m = shard_mask[i]
-        j = jnp.floor(
-            x[spatial_dimension] * num_divisions / box_length
+    def assign_particle_to_cell_loop_body(i, args):
+        particle_shard, particle_mask, cell_buffers, cell_buffer_masks, cell_counts = args
+        position = particle_shard[i]
+        mask_value = particle_mask[i]
+        cell_index = jnp.floor(
+            position[dimension_index] * num_cells / box_size
         ).astype(jnp.int32)
-        c = counts[j]
-        buffer_ = buffer_.at[j, c].set(x)
-        buffer_mask = buffer_mask.at[j, c].set(m)
-        counts = counts.at[j].set(c + (m > 0))
-        return shard, shard_mask, buffer_, buffer_mask, counts
+        current_count = cell_counts[cell_index]
+        cell_buffers = cell_buffers.at[cell_index, current_count].set(position)
+        cell_buffer_masks = cell_buffer_masks.at[cell_index, current_count].set(mask_value)
+        cell_counts = cell_counts.at[cell_index].set(current_count + (mask_value > 0))
+        return particle_shard, particle_mask, cell_buffers, cell_buffer_masks, cell_counts
 
-    shard, shard_mask, buffer_, buffer_mask, counts = jax.lax.fori_loop(
+    particle_shard, particle_mask, cell_buffers, cell_buffer_masks, cell_counts = jax.lax.fori_loop(
         lower=0,
-        upper=num_in_shard,
-        body_fun=loop_body,
-        init_val=(shard, shard_mask, buffer_, buffer_mask, counts),
+        upper=num_particles_in_shard,
+        body_fun=assign_particle_to_cell_loop_body,
+        init_val=(particle_shard, particle_mask, cell_buffers, cell_buffer_masks, cell_counts),
     )
-    return buffer_, buffer_mask, counts
+    return cell_buffers, cell_buffer_masks, cell_counts
 
 
-def merge_stream_dimension(
-    buffer_: jnp.array,
-    buffer_mask: jnp.array,
-    counts: jnp.array,
-    new_buffer_size: int = -1,
-):
-    """_summary_
+def merge_streams_into_cells(
+    cell_buffers: jnp.array,
+    cell_buffer_masks: jnp.array,
+    cell_counts: jnp.array,
+    target_buffer_size: int = -1,
+) -> Tuple[jnp.array, jnp.array, jnp.array]:
+    """Merges multiple streams of binned data into contiguous buffers per cell.
+    
+    This function consolidates data from multiple streams into a single buffer dimension
+    per cell. If a target buffer size is provided, it gathers valid particles into a
+    smaller, contiguous buffer.
 
     Args:
-        buffer (jnp.array[num_streams, num_divisions, division_buffer_size, 3]):
-        buffer_mask (jnp.array[num_streams, num_divisions, division_buffer_size]):
-        counts (jnp.array[num_streams, num_divisions]):
-        new_buffer_size (int):
+        cell_buffers (jnp.array[num_streams, num_cells, cell_buffer_size, data_dim]): 
+            Buffers from multiple streams.
+        cell_buffer_masks (jnp.array[num_streams, num_cells, cell_buffer_size]): 
+            Masks for the buffers.
+        cell_counts (jnp.array[num_streams, num_cells]): Counts per stream and cell.
+        target_buffer_size (int, optional): Desired size for the merged buffer. If -1, no resizing. Defaults to -1.
+
+    Returns:
+        merged_buffers (jnp.array[num_cells, merged_buffer_size, data_dim]): Merged particle buffers.
+        merged_buffer_masks (jnp.array[num_cells, merged_buffer_size]): Merged masks.
+        total_cell_counts (jnp.array[num_cells]): Total counts per cell across streams.
     """
-    num_streams, num_divisions, division_buffer_size = buffer_mask.shape
-    def push_stream_into_buffer_dim(arr):
-        right_sh = arr.shape[3:]
-        arr = jnp.swapaxes(arr, 1, 0)
-        return arr.reshape(num_divisions, num_streams * division_buffer_size, *right_sh)
+    num_streams, num_cells, cell_buffer_size = cell_buffer_masks.shape
+    
+    def flatten_streams_into_buffer_dim(array):
+        right_shape = array.shape[3:]
+        array = jnp.swapaxes(array, 1, 0)
+        return array.reshape(num_cells, num_streams * cell_buffer_size, *right_shape)
 
-    buffer_mask = push_stream_into_buffer_dim(buffer_mask)
-    buffer_ = push_stream_into_buffer_dim(buffer_)
+    merged_buffer_masks = flatten_streams_into_buffer_dim(cell_buffer_masks)
+    merged_buffers = flatten_streams_into_buffer_dim(cell_buffers)
 
-    if new_buffer_size != -1:
-        def naive_gather(div_buffer: jnp.array, div_mask: jnp.array):
-            """_summary_
-
+    if target_buffer_size != -1:
+        def gather_valid_particles(cell_buffer: jnp.array, cell_mask: jnp.array):
+            """Gathers valid (masked) particles into a contiguous array.
+            
             Args:
-                div_buffer (jnp.array[num_streams * division_buffer_size, 3]): 
-                div_mask (jnp.array[num_streams * division_buffer_size]): 
-                div_counts (jnp.array[num_streams * division_buffer_size]): 
+                cell_buffer (jnp.array[flattened_buffer_size, data_dim]): Flattened buffer for one cell.
+                cell_mask (jnp.array[flattened_buffer_size]): Mask for the buffer.
 
             Returns:
-                _type_: _description_
+                gathered_buffer (jnp.array[target_buffer_size, data_dim]): Contiguous valid particles.
+                gathered_mask (jnp.array[target_buffer_size]): Corresponding mask.
             """
-            (ixs,) = jnp.where(div_mask > 0, size=new_buffer_size, fill_value=-1)
-            mask = ixs != -1
-            return div_buffer[ixs], div_mask[ixs]
+            (valid_indices,) = jnp.where(cell_mask > 0, size=target_buffer_size, fill_value=-1)
+            valid_mask = valid_indices != -1
+            return cell_buffer[valid_indices], cell_mask[valid_indices] * valid_mask.astype(jnp.int32)
 
-        buffer_, buffer_mask = jax.vmap(naive_gather, in_axes=(0, 0))(
-            buffer_, buffer_mask
+        merged_buffers, merged_buffer_masks = jax.vmap(gather_valid_particles, in_axes=(0, 0))(
+            merged_buffers, merged_buffer_masks
         )
-        # def gather(div_buffer: jnp.array, div_mask: jnp.array, div_counts: jnp.array):
-        #     """_summary_
-
-        #     Args:
-        #         div_buffer (jnp.array[num_streams, division_buffer_size, 3]): 
-        #         div_mask (jnp.array[num_streams, division_buffer_size]): 
-        #         div_counts (jnp.array[num_streams, division_buffer_size]): 
-
-        #     Returns:
-        #         _type_: _description_
-        #     """
-        #     new_buffer = jnp.zeros((new_buffer_size, 3), dtype=buffer_.dtype)
-        #     new_mask = jnp.zeros((new_buffer_size,), dtype=buffer_mask.dtype)
-        #     # stream_ixs = jnp.arange(num_streams)
-        #     upper_ixs = jnp.cumsum(div_counts, axis=0)
-        #     lower_ixs = jnp.concatenate([jnp.zeros((1,), jnp.int32), upper_ixs[:-1]])
-
-        #     def loop_body(i, args):
-        #         new_buffer, new_mask = args
-        #         l = lower_ixs[i]
-        #         u = upper_ixs[i]
-        #         c = div_counts[i]
-        #         data = jax.lax.dynamic_slice(div_buffer[i], (0, 0), (c, 3))
-        #         # data = div_buffer[i, :c]
-        #         # mask = div_mask[i, :c]
-        #         # new_buffer = new_buffer.at[l:u].set(div_buffer[i, :c])
-        #         # new_mask = new_mask.at[l:u].set(mask)
-        #         new_buffer = jax.lax.dynamic_update_slice(new_buffer, data, (l,))
-        #         return new_buffer, new_mask
-
-        #     new_buffer, new_mask, *_ = jax.lax.fori_loop(
-        #         lower=0,
-        #         upper=num_streams,
-        #         body_fun=loop_body,
-        #         init_val=(new_buffer, new_mask),
-        #     )
-        #     # new_buffer, new_mask = jax.vmap(
-        #     #     slice_gather, in_axes=(None, None, 0, 0, 0, 0, 0)
-        #     # )(new_buffer, new_mask, buff, mask, count, lower_ixs, upper_ixs)
-        #     return new_buffer, new_mask
-
-        # buffer_ = jnp.swapaxes(buffer_, 1, 0)
-        # buffer_mask = jnp.swapaxes(buffer_mask, 1, 0)
-        # buffer_, buffer_mask = jax.vmap(gather, in_axes=(1, 1, 1))(
-        #     buffer_, buffer_mask, counts
-        # )
-        # gather = partial(
-        #     jax.lax.gather,
-        #     # operand,
-        #     # start_indices,
-        #     dimension_numbers=jax.lax.GatherDimensionNumbers(
-        #         offset_dims=,
-        #         collapsed_slice_dims=,
-        #         start_index_map=,
-        #     ),
-        #     # slice_sizes,
-        #     # *,
-        #     unique_indices=True,
-        #     indices_are_sorted=True,
-        #     mode=None,
-        #     fill_value=None,
-        # )
-
-        # def masked_gather(l, u, buffer_row, mask):
-        #     """Collect the points in the row of the buffer and place contiguously in a
-        #     smaller buffer.
-
-        #     Args:
-        #         buffer_row (_type_): 1d array of position data
-        #         mask (_type_): repeating structure every `division_buffer_size` where
-        #             there will potentially be points contiguously from the left
-        #             corresponding to the count size of that row. This could really have
-        #             two levels of gathering, the first a (1) dynamic slice because the
-        #             xla code may be able to do that quicker than a gather based on an
-        #             index array; then doing the second with an (2) index array along a
-        #             smaller axis (note this is just to collect the padded points in the
-        #             original buffer, or any points that are masked in the original
-        #             buffer). Currently I just implement (1).
-
-        #     Returns:
-        #         _type_: _description_
-        #     """
-        #     return jax.lax.gather(
-        #         operand,
-        #         start_indices,
-        #         dimension_numbers,
-        #         slice_sizes,
-        #         *,
-        #         unique_indices=False,
-        #         indices_are_sorted=False,
-        #         mode=None,
-        #         fill_value=None,
-        #     )
-        #     bool gather into new buffer dimension
-        #     return jax.lax.gather(buffer_, )
-        #     new_buffer = new_buffer.at[l:u].set(buffer_row[:u-l])
-        #     new_mask = new_mask.at[l:u].set(mask[:u-l])
-
-        # buffer_, buffer_mask = jax.vmap(
-        #     masked_gather, in_axes=(0, 0, 0, 0)
-        # )(lower_ixs, upper_ixs, buffer_, buffer_mask)
-    # else:
-    #     def push_stream_into_buffer_dim(arr):
-    #         right_sh = arr.shape[3:]
-    #         arr = jnp.swapaxes(arr, 1, 0)
-    #         return arr.reshape(num_divisions, num_streams * division_buffer_size, *right_sh)
-
-    #     buffer_mask = push_stream_into_buffer_dim(buffer_mask)
-    #     buffer_ = push_stream_into_buffer_dim(buffer_)
-
-    return buffer_, buffer_mask, counts.sum(axis=0)
+    
+    total_cell_counts = cell_counts.sum(axis=0)
+    return merged_buffers, merged_buffer_masks, total_cell_counts
 
 
-def buffer_data_contigously(
-    data: jnp.array,
-    atom_mask: jnp.array,
-    spatial_dimension: int,
-    new_buffer_size: int,
-    num_divisions: int,
+def bin_and_merge_particles_along_dimension(
+    particle_positions: jnp.array,
+    particle_masks: jnp.array,
+    dimension_index: int,
+    target_buffer_size: int,
+    num_cells: int,
     num_streams: int,
-    buffer_factor: float,
-    box_length: float,
-):
-    """_summary_
+    buffer_scale_factor: float,
+    box_size: float,
+) -> Tuple[jnp.array, jnp.array]:
+    """Bins particles along a single dimension and merges streams into contiguous buffers.
+    
+    This is a wrapper that applies binning to sharded data and then merges the results.
 
     Args:
-        data (jnp.array): _description_
-        atom_mask (jnp.array): _description_
-        spatial_dimension (int): _description_
-        new_buffer_size (int): _description_
-        num_divisions (int): _description_
-        num_streams (int): _description_
-        buffer_factor (float): _description_
-        box_length (float): _description_
+        particle_positions (jnp.array): Particle position data.
+        particle_masks (jnp.array): Masks for valid particles.
+        dimension_index (int): Dimension to bin along.
+        target_buffer_size (int): Size for the merged buffer per cell.
+        num_cells (int): Number of cells along the dimension.
+        num_streams (int): Number of parallel streams for processing.
+        buffer_scale_factor (float): Scaling factor for initial buffer sizes.
+        box_size (float): Box size along the dimension.
 
     Returns:
-        _type_: _description_
+        merged_buffers (jnp.array): Merged particle buffers.
+        merged_buffer_masks (jnp.array): Merged masks.
     """
-    straw = partial(
-        stream,
-        num_divisions=num_divisions,
-        box_length=box_length,
-        spatial_dimension=spatial_dimension,
-        buffer_factor=buffer_factor
+    bin_particles_partial = partial(
+        bin_particles_into_cells,
+        num_cells=num_cells,
+        box_size=box_size,
+        dimension_index=dimension_index,
+        buffer_scale_factor=buffer_scale_factor
     )
-    data = data.reshape(num_streams, -1, 3)
-    atom_mask = atom_mask.reshape(num_streams, -1)
-    buffer_, buffer_mask, counts = jax.vmap(straw, in_axes=(0, 0))(data, atom_mask)
-    buffer_, buffer_mask, counts = merge_stream_dimension(
-        buffer_, buffer_mask, counts, new_buffer_size=new_buffer_size
+    particle_positions = particle_positions.reshape(num_streams, -1, 3)
+    particle_masks = particle_masks.reshape(num_streams, -1)
+    cell_buffers, cell_buffer_masks, cell_counts = jax.vmap(bin_particles_partial, in_axes=(0, 0))(particle_positions, particle_masks)
+    merged_buffers, merged_buffer_masks, _ = merge_streams_into_cells(
+        cell_buffers, cell_buffer_masks, cell_counts, target_buffer_size=target_buffer_size
     )
-    return buffer_, buffer_mask
+    return merged_buffers, merged_buffer_masks
 
 
-def spatial_hash(
-    data: jnp.array,
-    mask: jnp.array,
+def spatial_hash_particles(
+    particle_positions: jnp.array,
+    particle_masks: jnp.array,
     num_dimensions: int,
-    num_divisions: Union[List[int], int],
-    n_streams: Union[List[int], int],
-    buffer_factors: Union[List[float], float],
-    box_size: Union[List[float], float],
-):
-    """You can append along the last dim of data, to hash by the first three indices of
-    the channel dimension.
+    num_cells_per_dim: Union[List[int], int],
+    num_streams_per_dim: Union[List[int], int],
+    buffer_scale_factors: Union[List[float], float],
+    box_sizes: Union[List[float], float],
+) -> Tuple[jnp.array, jnp.array, jnp.array]:
+    """Performs spatial hashing of particles into a multi-dimensional grid.
+    
+    This function bins particles sequentially along each dimension, using streams for
+    parallel processing. It supports appending along the last dimension of data for
+    hashing by the first three channels.
 
     Args:
-        data (jnp.array): _description_
-        mask (jnp.array): _description_
-        num_dimensions (int): _description_
-        num_divisions (Union[List[int], int]): _description_
-        n_streams (Union[List[int], int]): each voxels buffer must be written to sequen-
-          tially, with a counter, n_streams allows for the same voxel to have points
-          written to in parallel. Ensure that [n1, ..., ni, ...] n1 / ni is an int.
-        buffer_factors (Union[List[float], float]): _description_
-        box_size (Union[List[float], float]): _description_
+        particle_positions (jnp.array): Particle position data.
+        particle_masks (jnp.array): Masks for valid particles.
+        num_dimensions (int): Number of spatial dimensions to hash (e.g., 3 for 3D).
+        num_cells_per_dim (Union[List[int], int]): Number of cells per dimension.
+        num_streams_per_dim (Union[List[int], int]): Number of streams per dimension.
+        buffer_scale_factors (Union[List[float], float]): Buffer scaling per dimension.
+        box_sizes (Union[List[float], float]): Box sizes per dimension.
 
     Returns:
-        _type_: _description_
+        hashed_buffers (jnp.array): Hashed particle buffers in grid shape.
+        hashed_buffer_masks (jnp.array): Corresponding masks.
+        cell_counts (jnp.array): Counts per final cell.
     """
-    channel_dims = data.shape[-1]
+    channel_dims = particle_positions.shape[-1]
 
-    if type(box_size) is not list:
-        box_size = [box_size] * num_dimensions
-    if type(buffer_factors) is not list:
-        buffer_factors = [buffer_factors] * num_dimensions
-    if type(n_streams) is not list:
-        n_streams = [n_streams] * num_dimensions
-    if type(num_divisions) is not list:
-        num_divisions = [num_divisions] * num_dimensions
-    n_streams += [1]
+    if not isinstance(box_sizes, list):
+        box_sizes = [box_sizes] * num_dimensions
+    if not isinstance(buffer_scale_factors, list):
+        buffer_scale_factors = [buffer_scale_factors] * num_dimensions
+    if not isinstance(num_streams_per_dim, list):
+        num_streams_per_dim = [num_streams_per_dim] * num_dimensions
+    if not isinstance(num_cells_per_dim, list):
+        num_cells_per_dim = [num_cells_per_dim] * num_dimensions
+    num_streams_per_dim += [1]
 
-    data = data.reshape(n_streams[0], -1, channel_dims)
-    mask = mask.reshape(n_streams[0], -1)
-    # loops are in python, but only depend on static args, so shouldn't affect jax jit
-    for i in range(num_dimensions):
-        f = partial(
-            stream,
-            num_divisions=num_divisions[i],
-            box_length=box_size[i],
-            buffer_factor=buffer_factors[i],
-            spatial_dimension=i,
+    particle_positions = particle_positions.reshape(num_streams_per_dim[0], -1, channel_dims)
+    particle_masks = particle_masks.reshape(num_streams_per_dim[0], -1)
+    
+    # Sequentially bin along each dimension
+    for dim in range(num_dimensions):
+        bin_partial = partial(
+            bin_particles_into_cells,
+            num_cells=num_cells_per_dim[dim],
+            box_size=box_sizes[dim],
+            buffer_scale_factor=buffer_scale_factors[dim],
+            dimension_index=dim,
         )
-        for _ in range(i + 1):  # vmap leading dims [stream, *divisions]
-            f = jax.vmap(f)
-        data, mask, counts = f(data, mask)
+        # Vmap over leading dimensions (streams and previous divisions)
+        for _ in range(dim + 1):
+            bin_partial = jax.vmap(bin_partial)
+        particle_positions, particle_masks, cell_counts = bin_partial(particle_positions, particle_masks)
 
-        # put stream axis next to the buffer axis
-        stream_axis = i
-        new_hash_dim = i + 1
-        data = jnp.swapaxes(data, stream_axis, new_hash_dim)
-        mask = jnp.swapaxes(mask, stream_axis, new_hash_dim)
+        # Swap stream axis to be next to buffer axis
+        stream_axis = dim
+        new_hash_dim = dim + 1
+        particle_positions = jnp.swapaxes(particle_positions, stream_axis, new_hash_dim)
+        particle_masks = jnp.swapaxes(particle_masks, stream_axis, new_hash_dim)
 
-        # re-adjust buffer and streams
-        current_n_streams = n_streams[i]
-        next_n_streams = n_streams[i + 1]
-        curr_buff_size = data.shape[-2]
-        mult = current_n_streams // next_n_streams
-        assert current_n_streams % next_n_streams == 0
+        # Reshape for next dimension's streams and buffers
+        current_num_streams = num_streams_per_dim[dim]
+        next_num_streams = num_streams_per_dim[dim + 1]
+        current_buffer_size = particle_positions.shape[-2]
+        multiplier = current_num_streams // next_num_streams
+        assert current_num_streams % next_num_streams == 0
         new_shape = tuple(
-            num_divisions[:i + 1] + [next_n_streams, mult * curr_buff_size]
+            num_cells_per_dim[:dim + 1] + [next_num_streams, multiplier * current_buffer_size]
         )
-        data = data.reshape(*new_shape, channel_dims)
-        mask = mask.reshape(*new_shape)
+        particle_positions = particle_positions.reshape(*new_shape, channel_dims)
+        particle_masks = particle_masks.reshape(*new_shape)
 
-    # merge stream and buffer dimensions
-    data = data.reshape(*data.shape[:num_dimensions], -1, channel_dims)
-    mask = mask.reshape(*data.shape[:num_dimensions], -1)
-    return data, mask, counts
+    # Final merge of streams and buffers
+    particle_positions = particle_positions.reshape(*particle_positions.shape[:num_dimensions], -1, channel_dims)
+    particle_masks = particle_masks.reshape(*particle_positions.shape[:num_dimensions], -1)
+    return particle_positions, particle_masks, cell_counts
 
 
-def hash_3d_data(
-    data: jnp.array,
-    atom_mask: jnp.array,
-    num_divisions: int,
+def hash_3d_particles(
+    particle_positions: jnp.array,
+    particle_masks: jnp.array,
+    num_cells: int,
     num_streams: int,
-    box_length: float,
-    buffer_factor: float,
-    merged_buffer_factor: float,
-    n: int,
-):
-    """_summary_
+    box_size: float,
+    initial_buffer_scale: float,
+    merged_buffer_scale: float,
+    num_particles: int,
+) -> Tuple[jnp.array, jnp.array, int]:
+    """Hashes particles into a 3D grid for efficient spatial queries.
+    
+    This function applies binning and merging sequentially along x, y, z dimensions.
+    It calculates memory redundancy and lost points due to buffering.
 
     Args:
-        data (jnp.array): _description_
-        mask (jnp.array): _description_
-        num_divisions (int): _description_
-        num_streams (int): _description_
-        box_length (float): _description_
-        buffer_factor (float): _description_
-        merged_buffer_factor (float): _description_
-        n (int): _description_
+        particle_positions (jnp.array): Particle positions.
+        particle_masks (jnp.array): Particle masks.
+        num_cells (int): Number of cells per dimension.
+        num_streams (int): Number of streams for parallel processing.
+        box_size (float): Simulation box size (assumed cubic for simplicity).
+        initial_buffer_scale (float): Initial buffer scaling factor.
+        merged_buffer_scale (float): Scaling for merged buffers.
+        num_particles (int): Total number of particles.
 
     Returns:
-        _type_: _description_
+        hashed_buffers (jnp.array): 3D hashed buffers.
+        hashed_buffer_masks (jnp.array): Masks for hashed buffers.
+        num_lost_points (int): Number of points lost (should be 0 if buffers are sufficient).
     """
-    # data = data.reshape(num_streams, -1, 3)
-    # atom_mask = atom_mask.reshape(num_streams, -1)
+    def calculate_target_buffer_size(dim: int) -> int:
+        return math.ceil(
+            (merged_buffer_scale ** dim) * num_particles / (num_streams * num_cells ** dim)
+        ) * num_streams
 
-    new_buffer_size = lambda i: math.ceil(
-        (merged_buffer_factor ** i) * n / (num_streams * num_divisions ** i)
-    ) * num_streams
-
-    bdc = partial(
-        buffer_data_contigously,
-        num_divisions=num_divisions,
+    bin_and_merge_partial = partial(
+        bin_and_merge_particles_along_dimension,
+        num_cells=num_cells,
         num_streams=num_streams,
-        buffer_factor=buffer_factor,
-        box_length=box_length,
+        buffer_scale_factor=initial_buffer_scale,
+        box_size=box_size,
     )
-    data, atom_mask = bdc(
-        data=data,
-        atom_mask=atom_mask,
-        spatial_dimension=0,
-        new_buffer_size=new_buffer_size(1)
+    
+    # Bin along x (dimension 0)
+    particle_positions, particle_masks = bin_and_merge_partial(
+        particle_positions=particle_positions,
+        particle_masks=particle_masks,
+        dimension_index=0,
+        target_buffer_size=calculate_target_buffer_size(1)
     )
 
-    vbdc = jax.vmap(bdc, in_axes=(0, 0, None, None))
-    data, atom_mask = vbdc(data, atom_mask, 1, new_buffer_size(2))
+    # Vmap for y (dimension 1)
+    v_bin_and_merge = jax.vmap(bin_and_merge_partial, in_axes=(0, 0, None, None))
+    particle_positions, particle_masks = v_bin_and_merge(particle_positions, particle_masks, 1, calculate_target_buffer_size(2))
 
-    vvbdc = jax.vmap(vbdc, in_axes=(0, 0, None, None))
-    data, atom_mask = vvbdc(data, atom_mask, 2, new_buffer_size(3))
+    # Double vmap for z (dimension 2)
+    vv_bin_and_merge = jax.vmap(v_bin_and_merge, in_axes=(0, 0, None, None))
+    particle_positions, particle_masks = vv_bin_and_merge(particle_positions, particle_masks, 2, calculate_target_buffer_size(3))
 
-    memory_redundancy_factor = np.prod(atom_mask.shape) / n
-    num_lost_points = n - (atom_mask > 0).sum()
+    memory_redundancy = np.prod(particle_masks.shape) / num_particles
+    num_lost_points = num_particles - (particle_masks > 0).sum()
     print(
-        f"buffer_factor: {buffer_factor}\n"
-        f"merged_buffer_factor: {merged_buffer_factor}\n"
-        f"memory_redundancy_factor: {memory_redundancy_factor}\n"
+        f"initial_buffer_scale: {initial_buffer_scale}\n"
+        f"merged_buffer_scale: {merged_buffer_scale}\n"
+        f"memory_redundancy: {memory_redundancy}\n"
         f"num_lost_points: {num_lost_points}"
     )
-    return data, atom_mask, num_lost_points
+    return particle_positions, particle_masks, num_lost_points
 
 
-def load_data(path, permute=True, pad=True, num_streams=None):
-    X, resname, atom_name, box = read_frames(path)
+def load_trajectory_data(path, permute=True, pad=True, num_streams=None) -> Tuple[jnp.array, jnp.array, dict, jnp.array, int]:
+    """Loads molecular dynamics trajectory data and prepares it for processing.
+    
+    This function reads frames, assigns atom types, shifts positions to origin,
+    and optionally permutes and pads the data.
 
-    #####
-    # improve this later
-    _atom_name = [a[0] for a in atom_name]
-    atom_names = set(_atom_name)
-    a2i = {a: i for i, a in enumerate(atom_names, start=1)}
-    atom_type = jnp.array([a2i[a] for a in _atom_name]).astype(jnp.int32)
-    #####
+    Args:
+        path (str): Path to the trajectory file.
+        permute (bool, optional): Whether to randomly permute particles along the particle axis. Defaults to True.
+        pad (bool, optional): Whether to pad data to be divisible by num_streams. Defaults to True.
+        num_streams (int, optional): Required if pad=True; number of streams for sharding.
 
-    #####
-    # The data is a bit messy
-    X -= jnp.min(X.reshape(-1, 3), axis=0)[None, None, :]
-    box = jnp.maximum(jnp.max(X.reshape(-1, 3), axis=0), box)
-    #####
+    Returns:
+        positions (jnp.array[ts, n, 3]): Particle positions over timesteps.
+        atom_masks (jnp.array[ts, n]): Atom type masks (non-zero for valid atoms).
+        atom_type_map (dict): Mapping from atom names to integer types.
+        box_sizes (jnp.array[3]): Simulation box sizes.
+        num_particles (int): Original number of particles per frame.
+    """
+    positions, resnames, atom_names, box_sizes = read_frames(path)
 
-    ts, n, _ = X.shape
+    # Simple atom type encoding (improve later if needed)
+    atom_names_flat = [a[0] for a in atom_names]
+    unique_atom_names = set(atom_names_flat)
+    atom_type_map = {a: i for i, a in enumerate(unique_atom_names, start=1)}
+    atom_types = jnp.array([atom_type_map[a] for a in atom_names_flat]).astype(jnp.int32)
+
+    # Shift positions to origin and update box
+    positions -= jnp.min(positions.reshape(-1, 3), axis=0)[None, None, :]
+    box_sizes = jnp.maximum(jnp.max(positions.reshape(-1, 3), axis=0), box_sizes)
+
+    timesteps, num_particles, _ = positions.shape
 
     if permute:
         print("Permuting...")
-        ti = time.time()
+        start_time = time.time()
         key = jax.random.PRNGKey(seed=0)
-        X = jax.random.permutation(key, X, axis=-2, independent=True)
-        print(f"Done in {time.time() - ti}s")
+        positions = jax.random.permutation(key, positions, axis=-2, independent=True)
+        print(f"Done in {time.time() - start_time}s")
 
     if pad:
         assert num_streams is not None
-        num_per_shard = jnp.ceil(n / num_streams).astype(int)
-        padded_size = num_per_shard * num_streams
-        pad = jnp.zeros((ts, padded_size - n, 3), X.dtype)
-        atom_mask = jnp.concatenate(
-            [atom_type, jnp.zeros(padded_size - n, jnp.int32)], axis=-1
+        particles_per_stream = jnp.ceil(num_particles / num_streams).astype(int)
+        padded_size = particles_per_stream * num_streams
+        padding = jnp.zeros((timesteps, padded_size - num_particles, 3), positions.dtype)
+        atom_masks = jnp.concatenate(
+            [atom_types, jnp.zeros(padded_size - num_particles, jnp.int32)], axis=-1
         )
-        X = jnp.concatenate([X, pad], axis=1)
+        positions = jnp.concatenate([positions, padding], axis=1)
     else:
-        atom_mask = atom_type
+        atom_masks = atom_types
 
-    return X, atom_mask, a2i, box, n
+    return positions, atom_masks, atom_type_map, box_sizes, num_particles
 
 
-paths = [
-    # "/home/louis/Desktop/md_traj/md_0_1.trr",
-    "/data/md_0_1.trr",
-    "/Users/louisrobinson/Desktop/md/mac_mount/pmhc/md_0_1.trr",
-    "/home/louis/Dropbox/Cool/md/md_0_1.trr"
-]
+def visualize_trajectory(positions, atom_masks, atom_type_map, box_sizes, num_cells=15, output_file='trajectory.mp4'):
+    positions = np.array(positions)
+    atom_masks = np.array(atom_masks)
+    box_sizes = np.array(box_sizes)
+    
+    element_map = {v: k for k, v in atom_type_map.items()}
+    element_colors = {'N': 'blue', 'C': 'black', 'O': 'red', 'S': 'yellow'}
+    
+    valid_non_h = (atom_masks > 0) & (atom_masks != atom_type_map['H']) & (atom_masks != atom_type_map['O'])
+    
+    filtered_positions = positions[:, valid_non_h, :]
+    filtered_types = atom_masks[valid_non_h]
+    
+    cell_sizes = box_sizes / num_cells
+    central_cell = np.array([num_cells // 2] * 3)
+    
+    shift = cell_sizes * 1.5
+    
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    plt.tight_layout()
+
+    def plot_box(pos1, pos2, c):
+        x, y, z = pos1
+        x1, y1, z1 = pos2
+        ax.plot([x, x1], [y, y], [z, z], c=c)
+        ax.plot([x, x], [y, y1], [z, z], c=c)
+        ax.plot([x, x], [y, y], [z, z1], c=c)
+        ax.plot([x1, x], [y1, y1], [z1, z1], c=c)
+        ax.plot([x1, x1], [y1, y], [z1, z1], c=c)
+        ax.plot([x1, x1], [y1, y1], [z1, z], c=c)
+
+        ax.plot([x1, x], [y, y], [z1, z1], c=c)
+        ax.plot([x1, x], [y1, y1], [z, z], c=c)
+        ax.plot([x, x], [y1, y], [z1, z1], c=c)
+        ax.plot([x1, x1], [y1, y], [z, z], c=c)
+        ax.plot([x1, x1], [y, y], [z1, z], c=c)
+        ax.plot([x, x], [y1, y1], [z1, z], c=c)
+
+    def update(t):
+        ax.clear()
+        for offset in [[1, 1, 1], [-1, 1, 1], [1, -1, 1], [1, 1, -1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1], [-1, -1, 1]]:
+            plot_box(cell_sizes * (central_cell + offset), cell_sizes * (central_cell + 1 + offset), c="gray")
+
+        plot_box(cell_sizes * central_cell, cell_sizes * (central_cell + 1), c="orange")
+
+        pos_t = filtered_positions[t]
+        cell_idx = np.floor(pos_t / cell_sizes).astype(int)
+        is_central = np.all(cell_idx == central_cell, axis=1)
+        
+        unique_types = np.unique(filtered_types)
+        for typ in unique_types:
+            elem = element_map[typ]
+            color = element_colors.get(elem, 'green')  # Default color for unknown elements
+            type_mask = filtered_types == typ
+            central_mask = type_mask & is_central
+            other_mask = type_mask & ~is_central
+            
+            if np.any(central_mask):
+                ax.scatter(
+                    pos_t[central_mask, 0],
+                    pos_t[central_mask, 1],
+                    pos_t[central_mask, 2],
+                    c=color,
+                    alpha=0.8,
+                    s=28
+                )
+            if np.any(other_mask):
+                ax.scatter(
+                    pos_t[other_mask, 0],
+                    pos_t[other_mask, 1],
+                    pos_t[other_mask, 2],
+                    c=color,
+                    alpha=0.2,
+                    s=12
+                )
+        
+        ax.set_xlim(shift[0], box_sizes[0]-shift[0])
+        ax.set_ylim(shift[1], box_sizes[1]-shift[1])
+        ax.set_zlim(shift[2], box_sizes[2]-shift[2])
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+        ax.view_init(25, t)
+        # ax.set_title(f'Frame {t}')
+        return ax,
+    
+    ani = FuncAnimation(fig, update, frames=range(positions.shape[0]), blit=False, interval=200)
+    ani.save(output_file, writer='ffmpeg', fps=12)
+    plt.close(fig)
 
 
 def main():
-    run_all_frames = False
+    paths = [
+        "../mac_mount/pmhc/md_0_1.trr",
+        "/home/louis/Dropbox/Cool/md/md_0_1.trr"
+    ]
+    process_all_frames = False
 
-    if run_all_frames:
-        outpath = "frames/buffer"
-        os.makedirs(outpath, exist_ok=True)
+    if process_all_frames:
+        output_dir = "frames/buffer"
+        os.makedirs(output_dir, exist_ok=True)
 
         num_streams = 16
-        num_divisions = 8
-        spatial_dimension = 0
-        buffer_factor = 4.0
-        merged_buffer_factor = 1.5
+        num_cells = 8
+        dimension_index = 0
+        initial_buffer_scale = 4.0
+        merged_buffer_scale = 1.5  # Not used in this branch, but kept for consistency
 
-        X, atom_mask, a2i, box, n = load_data(
+        positions, atom_masks, atom_type_map, box_sizes, num_particles = load_trajectory_data(
             paths[0], permute=False, pad=True, num_streams=num_streams
         )
-        box_length = box[spatial_dimension]
+        box_size = box_sizes[dimension_index]
 
-        straw = partial(
-            stream,
-            num_divisions=num_divisions,
-            box_length=box_length,
-            spatial_dimension=spatial_dimension,
-            buffer_factor=buffer_factor
+        bin_particles_partial = partial(
+            bin_particles_into_cells,
+            num_cells=num_cells,
+            box_size=box_size,
+            dimension_index=dimension_index,
+            buffer_scale_factor=initial_buffer_scale
         )
-        vstraw = jax.jit(jax.vmap(straw, in_axes=(0, 0)))
-        for t in tqdm(range(X.shape[0])):
-            xp = X[t]
-            xp = xp.reshape(num_streams, -1, 3)
+        v_bin_particles = jax.jit(jax.vmap(bin_particles_partial, in_axes=(0, 0)))
+        for t in tqdm(range(positions.shape[0])):
+            frame_positions = positions[t]
+            frame_positions = frame_positions.reshape(num_streams, -1, 3)
 
-            buffer_, buffer_mask, counts = vstraw(xp, atom_mask)
+            cell_buffers, cell_buffer_masks, cell_counts = v_bin_particles(frame_positions, atom_masks)
 
-            print(f"num_per_shard: {num_per_shard}")
-            print(f"buffer.shape: {buffer_.shape}")
-            # print(f"buffer_mask.sum(-1): {buffer_mask.sum(-1)}")
-            plt.matshow(buffer_mask.sum(-1).T, vmin=0, vmax=buffer_.shape[2])
+            particles_per_stream = frame_positions.shape[1]
+            print(f"particles_per_stream: {particles_per_stream}")
+            print(f"cell_buffers.shape: {cell_buffers.shape}")
+            plt.matshow(cell_buffer_masks.sum(-1).T, vmin=0, vmax=cell_buffers.shape[2])
             plt.colorbar()
             plt.xlabel("num_streams")
-            plt.ylabel("num_divisions")
-            plt.savefig(f"{outpath}/t_{t}")
+            plt.ylabel("num_cells")
+            plt.savefig(f"{output_dir}/t_{t}")
             plt.close()
-            print(f"n: {n}")
-            print(f"buffer_mask.sum(): {buffer_mask.sum()}")
+            print(f"num_particles: {num_particles}")
+            print(f"cell_buffer_masks.sum(): {cell_buffer_masks.sum()}")
 
-        make_vid(outpath, video_name=f"{outpath}/video.mp4v")
+        # make_vid(output_dir, video_name=f"{output_dir}/video.mp4v")  # Commented out as make_vid is not defined
     else:
-        # at t=0 there is a data and memory dependency
-        # I can use this config to get no lost points:
-        # mem-redun: 5.86
-        #     num_streams = 16
-        #     num_divisions = 15
-        #     spatial_dimension = 0
-        #     buffer_factor = 7.0
-        #     merged_buffer_factor = 1.8
-        # With shuffling (50 seconds!) we can use to get no lost points:
-        # mem-redun: 1.76
-        #     num_streams = 16
-        #     num_divisions = 15
-        #     spatial_dimension = 0
-        #     buffer_factor = 5.0
-        #     merged_buffer_factor = 1.2
-        t = 0
+        # Configuration for no lost points with permutation
+        timestep = 0
 
         num_streams = 16
-        num_divisions = 15
-        spatial_dimension = 0
-        buffer_factor = 5.0
-        merged_buffer_factor = 1.2
+        num_cells = 15
+        dimension_index = 0
+        initial_buffer_scale = 5.0
+        merged_buffer_scale = 1.2
 
-        data, atom_mask, a2i, box, n = load_data(
-            paths[0], permute=True, pad=True, num_streams=num_streams
+        positions, atom_masks, atom_type_map, box_sizes, num_particles = load_trajectory_data(
+            paths[0], permute=False, pad=True, num_streams=num_streams
         )
-        box_length = box[spatial_dimension]
+        visualize_trajectory(positions, atom_masks, atom_type_map, box_sizes, num_cells=8, output_file='cells_trajectory.mp4')
+        box_size = box_sizes[dimension_index]
 
-        hash_3d_data = partial(
-            hash_3d_data,
-            num_divisions=num_divisions,
+        hash_3d_partial = partial(
+            hash_3d_particles,
+            num_cells=num_cells,
             num_streams=num_streams,
-            box_length=box_length,
-            buffer_factor=buffer_factor,
-            merged_buffer_factor=merged_buffer_factor,
-            n=n,
+            box_size=box_size,
+            initial_buffer_scale=initial_buffer_scale,
+            merged_buffer_scale=merged_buffer_scale,
+            num_particles=num_particles,
         )
-        hash_3d_data = jax.jit(hash_3d_data)
+        hash_3d_jitted = jax.jit(hash_3d_partial)
         for t in range(3):
             start = time.time()
-            _data, a_mask, num_lost_points = hash_3d_data(data[t], atom_mask)
+            hashed_buffers, hashed_masks, num_lost_points = hash_3d_jitted(positions[t], atom_masks)
             print(f"Time: {time.time() - start}s")
 
-        _mask = a_mask > 0
-        empty_space = jnp.argmax(_mask.reshape(-1, _mask.shape[-1])[:, ::-1], axis=-1).min()
-        for m in _mask.sum(-1):
-            plt.matshow(m)
-            plt.colorbar()
-            plt.show()
+        # valid_mask = hashed_masks > 0
+        # # Find the minimum empty space in the buffers (reversed argmax for trailing zeros)
+        # min_empty_space = jnp.argmax(valid_mask.reshape(-1, valid_mask.shape[-1])[:, ::-1], axis=-1).min()
+        # for slice_mask in valid_mask.sum(-1):
+        #     plt.matshow(slice_mask)
+        #     plt.colorbar()
+        #     plt.show()
         print(f"lost {int(num_lost_points)} points")
 
 
